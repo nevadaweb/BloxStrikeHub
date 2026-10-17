@@ -1,11 +1,13 @@
 -- ============================================================
---  BloxStrike Hub v2.0  |  Madium Executor  |  Level 7/8
---  Anti-Ban: Gaussian jitter (OU process), fps-independent
---  smoothing, target lock, velocity prediction, aim humanization
+--  BloxStrike Hub v3.0  |  Madium Executor  |  Level 7/8
+--  Aimbot: OU jitter, fps-independent smoothing, target lock,
+--          velocity prediction, humanization, ADS-only, silent aim
+--  ESP: Square boxes + outline, health bar, skeleton (R15/R6)
+--  Extras: triggerbot, team check, anti-kick, chams, speed, fly
 -- ============================================================
 
 -- ============================================================
--- §1  ESTADO GLOBAL — getgenv() persiste entre re-execuções
+-- §1  ESTADO GLOBAL — persiste entre re-execuções via getgenv()
 -- ============================================================
 
 if not getgenv().BSH then
@@ -14,13 +16,20 @@ if not getgenv().BSH then
         AimbotOn    = false,
         AimbotMode  = "Legit",   -- "Legit" | "Rage"
         FOV         = 120,
-        Smoothing   = 0.12,      -- 0..1 (base, 60fps-normalizado)
-        JitterSigma = 1.2,       -- desvio padrão do jitter em pixels de tela (OU sigma)
-        Prediction  = true,      -- lead velocity prediction
-        LockMs      = 350,       -- ms mínimos no mesmo alvo antes de trocar (sweet spot humano)
+        Smoothing   = 0.12,
+        JitterSigma = 1.2,
+        Prediction  = true,
+        LockMs      = 350,
+        ADSOnly     = false,     -- aimbot só ativo segurando RMB
+        AimPart     = "Head",    -- "Head" | "HumanoidRootPart" | "UpperTorso"
+        SilentAim   = false,     -- redireciona Mouse.Hit sem mover câmera
+        Triggerbot  = false,     -- auto-atira quando crosshair sobre inimigo
+        TeamCheck   = true,      -- ignora companheiros de time
 
         -- Visuals
         ESPOn       = false,
+        SkeletonOn  = false,
+        HealthBarOn = true,
         ChamsOn     = false,
         ESPColor    = Color3.fromRGB(255, 55, 55),
         ChamsColor  = Color3.fromRGB(255, 120, 0),
@@ -30,28 +39,23 @@ if not getgenv().BSH then
         WalkSpeed   = 60,
         FlyOn       = false,
 
-        -- Internos (não serializar no config)
-        DrawObjs    = {},   -- [player] = { Box={Line×4}, Name, Dist }
-        ChamsObjs   = {},   -- [player] = Highlight
+        -- Internos
+        DrawObjs    = {},   -- [player] = { Box, Outline, Name, Dist, Health, Skel }
+        ChamsObjs   = {},
         Conns       = {},
         Running     = true,
 
-        -- Estado do aimbot (não serializar)
         AimState = {
-            -- Ornstein-Uhlenbeck jitter state (processo discreto)
             jx = 0, jy = 0,
-            -- Target lock  (usa tick() — wall clock, não CPU time)
             lockedTarget = nil,
             lockedSince  = 0,
-            -- Velocity prediction buffer (EMA manual)
             lastHeadPos  = nil,
             lastHeadTime = 0,
             headVelocity = Vector3.zero,
         },
 
-        -- Estado do speed hack
-        SpeedTimer  = 0,
-        SpeedPhase  = math.random() * math.pi * 2,   -- fase inicial aleatória por sessão
+        SpeedTimer = 0,
+        SpeedPhase = math.random() * math.pi * 2,
     }
 end
 
@@ -73,31 +77,30 @@ local Mouse      = LP:GetMouse()
 -- §3  UTILITÁRIOS MATEMÁTICOS
 -- ============================================================
 
--- Box-Muller: gera amostra gaussiana com desvio padrão sigma
 local PI2 = math.pi * 2
+
 local function GaussRand(sigma)
-    local u1 = math.max(1e-10, math.random())   -- evita log(0)
+    local u1 = math.max(1e-10, math.random())
     local u2 = math.random()
     return sigma * math.sqrt(-2 * math.log(u1)) * math.cos(PI2 * u2)
 end
 
--- Converte alpha "por-frame a 60fps" para alpha frame-rate independente
--- Garante comportamento idêntico a 30, 60, 144, 240 fps
 local function FpsAlpha(base, dt)
-    local safe_dt   = math.min(dt, 0.1)          -- cap em 100ms (evita snap em hitch)
-    local safe_base = math.min(base, 0.9999)      -- evita NaN: 0^0 quando base=1, dt→0
+    local safe_dt   = math.min(dt, 0.1)
+    local safe_base = math.min(base, 0.9999)
     return 1 - math.pow(math.max(0, 1 - safe_base), safe_dt * 60)
 end
 
 -- ============================================================
--- §4  CONFIG SAVE / LOAD  (writefile / readfile)
+-- §4  CONFIG SAVE / LOAD
 -- ============================================================
 
-local CFG_FILE = "BSH_v2_config.json"
+local CFG_FILE = "BSH_v3_config.json"
 
 local SERIAL_KEYS = {
-    "AimbotOn","AimbotMode","FOV","Smoothing","JitterSigma",
-    "Prediction","LockMs","ESPOn","ChamsOn","SpeedOn","WalkSpeed",
+    "AimbotOn","AimbotMode","FOV","Smoothing","JitterSigma","Prediction","LockMs",
+    "ADSOnly","AimPart","SilentAim","Triggerbot","TeamCheck",
+    "ESPOn","SkeletonOn","HealthBarOn","ChamsOn","SpeedOn","WalkSpeed",
 }
 
 local function SaveConfig()
@@ -105,8 +108,7 @@ local function SaveConfig()
     for _, k in ipairs(SERIAL_KEYS) do t[k] = G[k] end
     t.ESPColor   = { G.ESPColor.R,   G.ESPColor.G,   G.ESPColor.B   }
     t.ChamsColor = { G.ChamsColor.R, G.ChamsColor.G, G.ChamsColor.B }
-    local ok, err = pcall(writefile, CFG_FILE, HTTP:JSONEncode(t))
-    return ok
+    return pcall(writefile, CFG_FILE, HTTP:JSONEncode(t))
 end
 
 local function LoadConfig()
@@ -129,9 +131,9 @@ LoadConfig()
 local Rayfield = loadstring(game:HttpGet("https://sirius.menu/rayfield"))()
 
 local Win = Rayfield:CreateWindow({
-    Name                   = "BloxStrike Hub v2",
+    Name                   = "BloxStrike Hub v3",
     LoadingTitle           = "BloxStrike Hub",
-    LoadingSubtitle        = "Madium | L8 | Anti-Ban",
+    LoadingSubtitle        = "Madium | L8 | Anti-Ban v3",
     Theme                  = "Default",
     DisableRayfieldPrompts = false,
     DisableBuildWarnings   = true,
@@ -147,17 +149,30 @@ TabCombat:CreateToggle({
     Name = "Aimbot", CurrentValue = G.AimbotOn, Flag = "abt",
     Callback = function(v)
         G.AimbotOn = v
-        -- Reset lock ao ligar/desligar para não herdar alvo fantasma
         local S = G.AimState
-        S.lockedTarget = nil
-        S.lockedSince  = 0
+        S.lockedTarget = nil; S.lockedSince = 0
     end,
+})
+
+TabCombat:CreateToggle({
+    Name = "ADS Only (Hold RMB)", CurrentValue = G.ADSOnly, Flag = "adsonly",
+    Callback = function(v) G.ADSOnly = v end,
 })
 
 TabCombat:CreateDropdown({
     Name = "Mode", Options = {"Legit", "Rage"},
     CurrentOption = { G.AimbotMode }, Flag = "abtmode",
     Callback = function(v) G.AimbotMode = v[1] end,
+})
+
+TabCombat:CreateDropdown({
+    Name = "Aim Part", Options = {"Head", "HumanoidRootPart", "UpperTorso"},
+    CurrentOption = { G.AimPart }, Flag = "aimpart",
+    Callback = function(v)
+        G.AimPart = v[1]
+        local S = G.AimState
+        S.lockedTarget = nil; S.lockedSince = 0
+    end,
 })
 
 TabCombat:CreateSlider({
@@ -189,6 +204,21 @@ TabCombat:CreateSlider({
     Callback = function(v) G.LockMs = v end,
 })
 
+TabCombat:CreateToggle({
+    Name = "Team Check", CurrentValue = G.TeamCheck, Flag = "teamchk",
+    Callback = function(v) G.TeamCheck = v end,
+})
+
+TabCombat:CreateToggle({
+    Name = "Silent Aim", CurrentValue = G.SilentAim, Flag = "silentaim",
+    Callback = function(v) G.SilentAim = v end,
+})
+
+TabCombat:CreateToggle({
+    Name = "Triggerbot", CurrentValue = G.Triggerbot, Flag = "triggerbot",
+    Callback = function(v) G.Triggerbot = v end,
+})
+
 -- ── ABA VISUALS ──────────────────────────────────────────────
 
 local TabVisuals = Win:CreateTab("Visuals", 4483362458)
@@ -198,12 +228,45 @@ TabVisuals:CreateToggle({
     Callback = function(v)
         G.ESPOn = v
         if not v then
-            for _, o in pairs(G.DrawObjs) do
-                for _, ln in pairs(o.Box) do pcall(function() ln:Remove() end) end
-                pcall(function() o.Name:Remove() end)
-                pcall(function() o.Dist:Remove() end)
+            for p, o in pairs(G.DrawObjs) do
+                if o then
+                    pcall(function() o.Box:Remove()     end)
+                    pcall(function() o.Outline:Remove() end)
+                    pcall(function() o.Name:Remove()    end)
+                    pcall(function() o.Dist:Remove()    end)
+                    pcall(function() o.Health:Remove()  end)
+                    if o.Skel then
+                        for _, ln in ipairs(o.Skel) do pcall(function() ln:Remove() end) end
+                    end
+                end
+                G.DrawObjs[p] = nil
             end
-            G.DrawObjs = {}
+        end
+    end,
+})
+
+TabVisuals:CreateToggle({
+    Name = "Skeleton ESP", CurrentValue = G.SkeletonOn, Flag = "skel",
+    Callback = function(v)
+        G.SkeletonOn = v
+        if not v then
+            for _, o in pairs(G.DrawObjs) do
+                if o and o.Skel then
+                    for _, ln in ipairs(o.Skel) do ln.Visible = false end
+                end
+            end
+        end
+    end,
+})
+
+TabVisuals:CreateToggle({
+    Name = "Health Bars", CurrentValue = G.HealthBarOn, Flag = "hpbar",
+    Callback = function(v)
+        G.HealthBarOn = v
+        if not v then
+            for _, o in pairs(G.DrawObjs) do
+                if o and o.Health then o.Health.Visible = false end
+            end
         end
     end,
 })
@@ -286,8 +349,8 @@ TabCfg:CreateButton({
     Callback = function()
         local ok = SaveConfig()
         Rayfield:Notify({
-            Title   = ok and "Saved" or "Save Error",
-            Content = ok and CFG_FILE or "Verifique permissoes do executor",
+            Title    = ok and "Saved" or "Save Error",
+            Content  = ok and CFG_FILE or "Verifique permissoes do executor",
             Duration = 3,
         })
     end,
@@ -307,9 +370,16 @@ TabCfg:CreateButton({
         G.Running = false
         for _, c in pairs(G.Conns) do pcall(function() c:Disconnect() end) end
         for _, o in pairs(G.DrawObjs) do
-            for _, ln in pairs(o.Box) do pcall(function() ln:Remove() end) end
-            pcall(function() o.Name:Remove() end)
-            pcall(function() o.Dist:Remove() end)
+            if o then
+                pcall(function() o.Box:Remove()     end)
+                pcall(function() o.Outline:Remove() end)
+                pcall(function() o.Name:Remove()    end)
+                pcall(function() o.Dist:Remove()    end)
+                pcall(function() o.Health:Remove()  end)
+                if o.Skel then
+                    for _, ln in ipairs(o.Skel) do pcall(function() ln:Remove() end) end
+                end
+            end
         end
         for _, h in pairs(G.ChamsObjs) do pcall(function() h:Destroy() end) end
         if G.FOVCircle then pcall(function() G.FOVCircle:Remove() end) end
@@ -318,7 +388,7 @@ TabCfg:CreateButton({
 })
 
 -- ============================================================
--- §6  FOV CIRCLE  (Drawing — segue o mouse)
+-- §6  FOV CIRCLE
 -- ============================================================
 
 G.FOVCircle = Drawing.new("Circle")
@@ -333,47 +403,78 @@ G.FOVCircle.Visible      = false
 -- §7  UTILITÁRIOS DE JOGO
 -- ============================================================
 
+-- Tabelas de ossos para skeleton ESP
+local R15_BONES = {
+    {"Head",         "UpperTorso"},
+    {"UpperTorso",   "LowerTorso"},
+    {"LowerTorso",   "LeftUpperLeg"},
+    {"LowerTorso",   "RightUpperLeg"},
+    {"LeftUpperLeg", "LeftLowerLeg"},
+    {"RightUpperLeg","RightLowerLeg"},
+    {"LeftLowerLeg", "LeftFoot"},
+    {"RightLowerLeg","RightFoot"},
+    {"UpperTorso",   "LeftUpperArm"},
+    {"UpperTorso",   "RightUpperArm"},
+    {"LeftUpperArm", "LeftLowerArm"},
+    {"RightUpperArm","RightLowerArm"},
+    {"LeftLowerArm", "LeftHand"},
+    {"RightLowerArm","RightHand"},
+}
+
+local R6_BONES = {
+    {"Head",   "Torso"},
+    {"Torso",  "Left Arm"},
+    {"Torso",  "Right Arm"},
+    {"Torso",  "Left Leg"},
+    {"Torso",  "Right Leg"},
+}
+
 local function IsValid(player)
     if player == LP then return false end
     local c = player.Character
     if not c then return false end
     local h = c:FindFirstChildOfClass("Humanoid")
     if not h or h.Health <= 0 then return false end
-    return c:FindFirstChild("HumanoidRootPart") ~= nil
+    if not c:FindFirstChild("HumanoidRootPart") then return false end
+    -- Team check: ignora se mesmo time (quando habilitado)
+    if G.TeamCheck then
+        local lpTeam = LP.Team
+        if lpTeam and player.Team == lpTeam then return false end
+    end
+    return true
 end
 
--- Bounding box 2D para ESP  →  (origin:Vector2, w:number, h:number) | nil
+-- Bounding box 2D via HumanoidRootPart
 local function GetBounds(char)
     local hrp = char:FindFirstChild("HumanoidRootPart")
     if not hrp then return nil end
     local p    = hrp.Position
     local topV = Camera:WorldToViewportPoint(p + Vector3.new(0,  3.1, 0))
     local botV = Camera:WorldToViewportPoint(p + Vector3.new(0, -2.9, 0))
-    if topV.Z <= 0 then return nil end   -- behind camera
+    if topV.Z <= 0 then return nil end
     local h = math.abs(botV.Y - topV.Y)
-    if h < 2 then return nil end          -- too small / very far
+    if h < 2 then return nil end
     local w = h * 0.55
     return Vector2.new(topV.X - w * 0.5, topV.Y), w, h
 end
 
--- ============================================================
--- §8  AIMBOT — JITTER GAUSSIANO (Ornstein-Uhlenbeck discreto)
--- ============================================================
--- Fórmula discreta exata: dX = -θ·X·dt + σ·√dt·N(0,1)
--- Propriedades garantidas:
---   • Correlação temporal (tremor de mão, não white noise)
---   • Média zero (não deriva — reversão automática)
---   • Amplitude σ em pixels de tela, independente de distância ao alvo
---   • Cada frame é único — nunca se repete (seed do GaussRand)
+-- Retorna HP ratio (0..1) de um character
+local function GetHPRatio(char)
+    local hum = char:FindFirstChildOfClass("Humanoid")
+    if not hum or hum.MaxHealth <= 0 then return 1 end
+    return math.clamp(hum.Health / hum.MaxHealth, 0, 1)
+end
 
-local OU_THETA = 9.0   -- velocidade de reversão à média (8~12 = fisiologicamente humano)
+-- ============================================================
+-- §8  AIMBOT — JITTER GAUSSIANO (Ornstein-Uhlenbeck)
+-- ============================================================
+
+local OU_THETA = 9.0
 
 local function StepOUJitter(dt)
     local S      = G.AimState
     local sigma  = G.JitterSigma
-    -- Cap no sqrt(dt) equivalente a ~30fps para evitar explosão em framedrops
     local sqrtDt = math.sqrt(math.min(dt, 0.033))
-    -- Processo OU discreto: independente em X e Y
     S.jx = S.jx + (-OU_THETA * S.jx * dt) + (sigma * sqrtDt * GaussRand(1))
     S.jy = S.jy + (-OU_THETA * S.jy * dt) + (sigma * sqrtDt * GaussRand(1))
 end
@@ -382,42 +483,44 @@ end
 -- §9  AIMBOT — SELEÇÃO DE ALVO COM TARGET LOCK
 -- ============================================================
 
+local function GetAimPart(char)
+    -- Prioridade: AimPart configurado → UpperTorso (R15 fallback) → HumanoidRootPart
+    return char:FindFirstChild(G.AimPart)
+        or char:FindFirstChild("HumanoidRootPart")
+end
+
 local function GetTarget(dt)
     local S   = G.AimState
-    -- tick() = wall clock (correto para medir latência real)
-    -- os.clock() = CPU time (não usar para lock timers)
     local now = tick()
     local mp  = Vector2.new(Mouse.X, Mouse.Y)
 
-    -- Se tem alvo locado, verifica se ainda é válido
+    -- Mantém alvo lockado enquanto válido e dentro do LockMs
     if S.lockedTarget then
         local locked  = S.lockedTarget
-        local elapsed = (now - S.lockedSince) * 1000   -- ms
+        local elapsed = (now - S.lockedSince) * 1000
         if IsValid(locked) then
-            local head = locked.Character and locked.Character:FindFirstChild("Head")
-            if head then
-                local sp = Camera:WorldToViewportPoint(head.Position)
+            local part = locked.Character and GetAimPart(locked.Character)
+            if part then
+                local sp = Camera:WorldToViewportPoint(part.Position)
                 if sp.Z > 0 then
                     local d = (mp - Vector2.new(sp.X, sp.Y)).Magnitude
-                    -- Mantém lock se dentro do FOV expandido (1.3x evita flicker na borda)
                     if d <= G.FOV * 1.3 and elapsed < G.LockMs then
                         return locked
                     end
                 end
             end
         end
-        S.lockedTarget = nil
-        S.lockedSince  = 0
+        S.lockedTarget = nil; S.lockedSince = 0
     end
 
-    -- Busca novo melhor alvo (menor distância ao mouse dentro do FOV)
+    -- Busca melhor alvo
     local best    = nil
     local minDist = G.FOV
     for _, p in ipairs(Players:GetPlayers()) do
         if not IsValid(p) then continue end
-        local head = p.Character:FindFirstChild("Head")
-        if not head then continue end
-        local sp = Camera:WorldToViewportPoint(head.Position)
+        local part = GetAimPart(p.Character)
+        if not part then continue end
+        local sp = Camera:WorldToViewportPoint(part.Position)
         if sp.Z <= 0 then continue end
         local d = (mp - Vector2.new(sp.X, sp.Y)).Magnitude
         if d < minDist then minDist = d; best = p end
@@ -436,60 +539,61 @@ end
 -- ============================================================
 -- §10  AIMBOT — PREDIÇÃO DE VELOCIDADE
 -- ============================================================
+-- Usa AssemblyLinearVelocity (novo solver Roblox) com fallback para .Velocity
 
-local function UpdateVelocity(head)
+local function GetPartVelocity(part)
+    -- AssemblyLinearVelocity disponível em executores L7+ que expõem o novo physics
+    local vel = nil
+    pcall(function() vel = part.AssemblyLinearVelocity end)
+    if vel and vel.Magnitude > 0 then return vel end
+    pcall(function() vel = part.Velocity end)
+    return vel or Vector3.zero
+end
+
+local function UpdateVelocity(part)
     local S   = G.AimState
-    local now = tick()   -- wall clock consistente com GetTarget
+    local now = tick()
     if S.lastHeadPos and S.lastHeadTime > 0 then
         local dt_v = now - S.lastHeadTime
-        -- Ignora gaps > 150ms (lagspike descarta amostra ruidosa)
         if dt_v > 0.001 and dt_v < 0.15 then
-            local rawVel = (head.Position - S.lastHeadPos) / dt_v
-            -- EMA alpha=0.35: responsivo mas não caótico
+            local rawVel = (part.Position - S.lastHeadPos) / dt_v
             S.headVelocity = S.headVelocity:Lerp(rawVel, 0.35)
         end
     end
-    S.lastHeadPos  = head.Position
+    S.lastHeadPos  = part.Position
     S.lastHeadTime = now
 end
 
-local function PredictedPos(head)
-    if not G.Prediction then return head.Position end
+local function PredictedPos(part)
+    if not G.Prediction then return part.Position end
     local S    = G.AimState
-    -- Obtém ping real via Stats (fallback 65ms)
     local pingS = 0.065
     pcall(function()
         pingS = game:GetService("Stats").Network.ServerStatsItem["Data Ping"]:GetValue() / 1000
     end)
-    -- Lead 65% do ping: o servidor já processou parte do movimento
-    -- Cap em 150ms para não over-predict em lag spike
-    local lead = math.min(pingS * 0.65, 0.15)
-    return head.Position + S.headVelocity * lead
+    -- Também usa AssemblyLinearVelocity direto se disponível para a lead
+    local physVel = GetPartVelocity(part)
+    local vel     = physVel.Magnitude > 0.5 and physVel or S.headVelocity
+    local lead    = math.min(pingS * 0.65, 0.15)
+    return part.Position + vel * lead
 end
 
 -- ============================================================
 -- §11  AIMBOT — HUMANIZAÇÃO DO PONTO DE MIRA
 -- ============================================================
--- Em vez de apontar sempre para o centro exato do Head,
--- aplica um offset gaussiano dentro da hitbox sphere (~0.5 studs raio).
--- O offset persiste por N frames para simular micro-ajuste humano.
 
 local AimOffset    = Vector3.zero
 local AimOffTimer  = 0
-local AimOffNext   = 0.09   -- próxima troca (randomizado)
-local HITBOX_R     = 0.45   -- raio do Head hitbox em studs
+local AimOffNext   = 0.09
+local HITBOX_R     = 0.45
 
-local function GetHumanizedAimPoint(headPos, dt)
+local function GetHumanizedAimPoint(pos, dt)
     AimOffTimer = AimOffTimer + dt
     if AimOffTimer >= AimOffNext then
         AimOffTimer = 0
-        -- Intervalo randomizado 80-150ms → imita sacada micro-saccade humana
         AimOffNext  = math.random(80, 150) / 1000
-
-        -- Rejection sampling: gera offset dentro da esfera do hitbox
         local ox, oy, oz
-        local maxTries = 8
-        for _ = 1, maxTries do
+        for _ = 1, 8 do
             ox = GaussRand(HITBOX_R * 0.45)
             oy = GaussRand(HITBOX_R * 0.40)
             oz = GaussRand(HITBOX_R * 0.25)
@@ -497,111 +601,224 @@ local function GetHumanizedAimPoint(headPos, dt)
         end
         AimOffset = Vector3.new(ox, oy, oz)
     end
-    return headPos + AimOffset
+    return pos + AimOffset
 end
 
 -- ============================================================
 -- §12  AIMBOT — SMOOTHING ADAPTIVO
 -- ============================================================
--- Longe do alvo: smoothing mais rápido (aquisição)
--- Perto do alvo: smoothing mais lento (precisão final)
--- Sem dead zone agressiva — imita como humano para o mouse naturalmente
 
 local function AdaptiveAlpha(screenDistPx, baseAlpha, dt)
     local scale
     if screenDistPx > 120 then
-        scale = 1.6   -- acelera aquisição
+        scale = 1.6
     elseif screenDistPx < 20 then
-        scale = 0.55  -- desacelera para precisão
+        scale = 0.55
     else
-        -- Interpolação suave entre os extremos
         scale = 1.6 - (1.6 - 0.55) * ((120 - screenDistPx) / 100)
     end
     return FpsAlpha(math.min(1, baseAlpha * scale), dt)
 end
 
 -- ============================================================
--- §13  ESP — DRAWING OBJECTS
+-- §13  ESP — DRAWING OBJECTS (Square + outline + health + skeleton)
 -- ============================================================
+
+local function MakeLine()
+    local ln = Drawing.new("Line")
+    ln.Thickness = 1; ln.Color = Color3.fromRGB(255,255,0); ln.Visible = false
+    return ln
+end
 
 local function CreateESP(player)
     if G.DrawObjs[player] then return end
-    local box = {}
-    for i = 1, 4 do
-        local ln      = Drawing.new("Line")
-        ln.Thickness  = 1.5
-        ln.Color      = G.ESPColor
-        ln.Visible    = false
-        box[i]        = ln
-    end
-    local nm = Drawing.new("Text")
-    nm.Size = 13; nm.Color = Color3.fromRGB(255,255,255)
-    nm.Outline = true; nm.OutlineColor = Color3.fromRGB(0,0,0)
-    nm.Center = true; nm.Visible = false
-    local dt = Drawing.new("Text")
-    dt.Size = 11; dt.Color = Color3.fromRGB(195,195,195)
-    dt.Outline = true; dt.OutlineColor = Color3.fromRGB(0,0,0)
-    dt.Center = true; dt.Visible = false
-    G.DrawObjs[player] = { Box = box, Name = nm, Dist = dt }
+
+    -- Box principal
+    local box         = Drawing.new("Square")
+    box.Thickness     = 1.5
+    box.Filled        = false
+    box.Color         = G.ESPColor
+    box.Visible       = false
+
+    -- Outline preta (1px maior em cada lado = +2 no size)
+    local outline         = Drawing.new("Square")
+    outline.Thickness     = 3
+    outline.Filled        = false
+    outline.Color         = Color3.fromRGB(0, 0, 0)
+    outline.Visible       = false
+
+    -- Nome
+    local nm          = Drawing.new("Text")
+    nm.Size           = 13
+    nm.Color          = Color3.fromRGB(255, 255, 255)
+    nm.Outline        = true
+    nm.OutlineColor   = Color3.fromRGB(0, 0, 0)
+    nm.Center         = true
+    nm.Visible        = false
+
+    -- Distância
+    local dt          = Drawing.new("Text")
+    dt.Size           = 11
+    dt.Color          = Color3.fromRGB(195, 195, 195)
+    dt.Outline        = true
+    dt.OutlineColor   = Color3.fromRGB(0, 0, 0)
+    dt.Center         = true
+    dt.Visible        = false
+
+    -- Barra de HP (linha vertical à esquerda da box)
+    local hp          = Drawing.new("Line")
+    hp.Thickness      = 3
+    hp.Visible        = false
+
+    -- Background da barra de HP
+    local hpBg        = Drawing.new("Line")
+    hpBg.Thickness    = 3
+    hpBg.Color        = Color3.fromRGB(30, 30, 30)
+    hpBg.Visible      = false
+
+    -- Skeleton lines (criadas sob demanda no primeiro UpdateESP)
+    G.DrawObjs[player] = {
+        Box = box, Outline = outline,
+        Name = nm, Dist = dt,
+        Health = hp, HealthBg = hpBg,
+        Skel = {},
+        SkelBoneCount = 0,
+    }
 end
 
 local function RemoveESP(player)
     local o = G.DrawObjs[player]
     if not o then return end
-    for _, ln in pairs(o.Box) do pcall(function() ln:Remove() end) end
-    pcall(function() o.Name:Remove() end)
-    pcall(function() o.Dist:Remove() end)
+    pcall(function() o.Box:Remove()      end)
+    pcall(function() o.Outline:Remove()  end)
+    pcall(function() o.Name:Remove()     end)
+    pcall(function() o.Dist:Remove()     end)
+    pcall(function() o.Health:Remove()   end)
+    pcall(function() o.HealthBg:Remove() end)
+    for _, ln in ipairs(o.Skel) do pcall(function() ln:Remove() end) end
     G.DrawObjs[player] = nil
 end
 
 local function UpdateESP(player)
     local o = G.DrawObjs[player]
     if not o then return end
-    if not G.ESPOn or not IsValid(player) then
-        for _, ln in pairs(o.Box) do ln.Visible = false end
-        o.Name.Visible = false; o.Dist.Visible = false
-        return
+
+    local function hideAll()
+        o.Box.Visible      = false
+        o.Outline.Visible  = false
+        o.Name.Visible     = false
+        o.Dist.Visible     = false
+        o.Health.Visible   = false
+        o.HealthBg.Visible = false
+        for _, ln in ipairs(o.Skel) do ln.Visible = false end
     end
-    local origin, w, h = GetBounds(player.Character)
-    if not origin then
-        for _, ln in pairs(o.Box) do ln.Visible = false end
-        o.Name.Visible = false; o.Dist.Visible = false
-        return
-    end
+
+    if not G.ESPOn or not IsValid(player) then hideAll(); return end
+
+    local char   = player.Character
+    local origin, w, h = GetBounds(char)
+    if not origin then hideAll(); return end
+
     local x, y, col = origin.X, origin.Y, G.ESPColor
-    -- Top
-    o.Box[1].From = Vector2.new(x,   y);     o.Box[1].To = Vector2.new(x+w, y)
-    -- Bottom
-    o.Box[2].From = Vector2.new(x,   y+h);   o.Box[2].To = Vector2.new(x+w, y+h)
-    -- Left
-    o.Box[3].From = Vector2.new(x,   y);     o.Box[3].To = Vector2.new(x,   y+h)
-    -- Right
-    o.Box[4].From = Vector2.new(x+w, y);     o.Box[4].To = Vector2.new(x+w, y+h)
-    for _, ln in pairs(o.Box) do ln.Color = col; ln.Visible = true end
-    -- Label
-    local hrp  = player.Character:FindFirstChild("HumanoidRootPart")
+
+    -- Outline (drawn behind box, slightly larger)
+    o.Outline.Position = Vector2.new(x - 1, y - 1)
+    o.Outline.Size     = Vector2.new(w + 2, h + 2)
+    o.Outline.Visible  = true
+
+    -- Main box
+    o.Box.Position = Vector2.new(x, y)
+    o.Box.Size     = Vector2.new(w, h)
+    o.Box.Color    = col
+    o.Box.Visible  = true
+
+    -- Name tag
+    local hrp  = char:FindFirstChild("HumanoidRootPart")
     local dist = hrp and math.floor((Camera.CFrame.Position - hrp.Position).Magnitude) or 0
-    o.Name.Position = Vector2.new(x + w*0.5, y - 16)
+    o.Name.Position = Vector2.new(x + w * 0.5, y - 16)
     o.Name.Text     = player.Name
     o.Name.Visible  = true
-    o.Dist.Position = Vector2.new(x + w*0.5, y - 5)
+
+    -- Distance tag (below box)
+    o.Dist.Position = Vector2.new(x + w * 0.5, y + h + 2)
     o.Dist.Text     = dist .. " st"
     o.Dist.Visible  = true
+
+    -- Health bar (vertical line 5px à esquerda da box)
+    if G.HealthBarOn then
+        local hpRatio  = GetHPRatio(char)
+        local barX     = x - 5
+        local barBot   = y + h
+        local barTop   = y
+        local barFill  = barBot - (h * hpRatio)
+
+        -- Background (toda a altura)
+        o.HealthBg.From    = Vector2.new(barX, barBot)
+        o.HealthBg.To      = Vector2.new(barX, barTop)
+        o.HealthBg.Visible = true
+
+        -- Barra colorida (verde→amarelo→vermelho via HSV)
+        o.Health.From    = Vector2.new(barX, barBot)
+        o.Health.To      = Vector2.new(barX, barFill)
+        o.Health.Color   = Color3.fromHSV(hpRatio * 0.33, 1, 1)
+        o.Health.Visible = true
+    else
+        o.Health.Visible   = false
+        o.HealthBg.Visible = false
+    end
+
+    -- Skeleton
+    if G.SkeletonOn then
+        local isR15 = char:FindFirstChild("UpperTorso") ~= nil
+        local bones = isR15 and R15_BONES or R6_BONES
+        local nBones = #bones
+
+        -- Cria novas linhas se necessário
+        for i = #o.Skel + 1, nBones do
+            o.Skel[i] = MakeLine()
+        end
+
+        for i, pair in ipairs(bones) do
+            local partA = char:FindFirstChild(pair[1])
+            local partB = char:FindFirstChild(pair[2])
+            local ln    = o.Skel[i]
+            if partA and partB then
+                local spA = Camera:WorldToViewportPoint(partA.Position)
+                local spB = Camera:WorldToViewportPoint(partB.Position)
+                if spA.Z > 0 and spB.Z > 0 then
+                    ln.From    = Vector2.new(spA.X, spA.Y)
+                    ln.To      = Vector2.new(spB.X, spB.Y)
+                    ln.Color   = col
+                    ln.Visible = true
+                else
+                    ln.Visible = false
+                end
+            else
+                ln.Visible = false
+            end
+        end
+
+        -- Esconde linhas excedentes (se mudou de R15 para R6)
+        for i = nBones + 1, #o.Skel do
+            o.Skel[i].Visible = false
+        end
+    else
+        for _, ln in ipairs(o.Skel) do ln.Visible = false end
+    end
 end
 
 -- ============================================================
--- §14  CHAMS — HIGHLIGHT  (com fix de orphan pós-respawn)
+-- §14  CHAMS — HIGHLIGHT
 -- ============================================================
 
 local function CreateChams(player)
     local c = player.Character
     if not c then return end
-    -- Garante destruição de qualquer highlight orphan antes de criar
     if G.ChamsObjs[player] then
         pcall(function() G.ChamsObjs[player]:Destroy() end)
         G.ChamsObjs[player] = nil
     end
-    local h = Instance.new("Highlight")
+    local h               = Instance.new("Highlight")
     h.FillColor           = G.ChamsColor
     h.OutlineColor        = G.ChamsColor
     h.FillTransparency    = 0.5
@@ -618,55 +835,36 @@ local function RemoveChams(player)
 end
 
 local function UpdateChams(player)
-    if not G.ChamsOn or not IsValid(player) then
-        RemoveChams(player)
-        return
-    end
+    if not G.ChamsOn or not IsValid(player) then RemoveChams(player); return end
     local c = player.Character
     local h = G.ChamsObjs[player]
-
-    -- Se o highlight existe mas não está mais no char correto (respawn),
-    -- ou já foi destruído, recria do zero
     if h then
-        local ok = pcall(function()
-            local _ = h.Parent   -- lança erro se h está destroyed
-        end)
+        local ok = pcall(function() local _ = h.Parent end)
         if not ok or h.Parent ~= c then
-            -- orphan detectado: recriar
             pcall(function() h:Destroy() end)
-            G.ChamsObjs[player] = nil
-            h = nil
+            G.ChamsObjs[player] = nil; h = nil
         end
     end
-
-    if not h then
-        CreateChams(player)
-    end
+    if not h then CreateChams(player) end
 end
 
 -- ============================================================
--- §15  SPEED HACK — onda senoidal + ruído gaussiano
+-- §15  SPEED HACK
 -- ============================================================
--- Combinação de seno (variação periódica natural) + gaussian noise
--- para que a velocidade nunca seja uma constante detectável.
 
 local function ApplySpeed(dt)
     local c = LP.Character
     if not c then return end
     local hum = c:FindFirstChildOfClass("Humanoid")
     if not hum then return end
-
     G.SpeedTimer = G.SpeedTimer + dt
-    -- Seno com período ~2.3s + fase diferente a cada sessão
     local sineVar  = math.sin(G.SpeedTimer * (math.pi / 1.15)) * 2.2
-    -- Gaussian noise ±0.8 studs/s (pequeno mas não zero)
     local noiseVar = GaussRand(0.5)
-
-    hum.WalkSpeed = math.max(16, G.WalkSpeed + sineVar + noiseVar)
+    hum.WalkSpeed  = math.max(16, G.WalkSpeed + sineVar + noiseVar)
 end
 
 -- ============================================================
--- §16  FLY HACK — BodyVelocity + BodyGyro
+-- §16  FLY HACK
 -- ============================================================
 
 local function EnsureFlyParts()
@@ -676,7 +874,6 @@ local function EnsureFlyParts()
     if not hrp then return nil, nil end
     local hum = c:FindFirstChildOfClass("Humanoid")
     if not hum then return nil, nil end
-
     if not c:FindFirstChild("_BSH_BV") then
         hum.PlatformStand = true
         local bv = Instance.new("BodyVelocity")
@@ -698,21 +895,19 @@ local function UpdateFly()
     if not bv or not bg then return end
     local dir   = Vector3.zero
     local speed = 65
-    if UIS:IsKeyDown(Enum.KeyCode.W) then dir = dir + Camera.CFrame.LookVector  end
-    if UIS:IsKeyDown(Enum.KeyCode.S) then dir = dir - Camera.CFrame.LookVector  end
-    if UIS:IsKeyDown(Enum.KeyCode.A) then dir = dir - Camera.CFrame.RightVector end
-    if UIS:IsKeyDown(Enum.KeyCode.D) then dir = dir + Camera.CFrame.RightVector end
-    if UIS:IsKeyDown(Enum.KeyCode.Space)       then dir = dir + Vector3.new(0,  1, 0) end
-    if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then dir = dir + Vector3.new(0, -1, 0) end
+    if UIS:IsKeyDown(Enum.KeyCode.W)           then dir = dir + Camera.CFrame.LookVector  end
+    if UIS:IsKeyDown(Enum.KeyCode.S)           then dir = dir - Camera.CFrame.LookVector  end
+    if UIS:IsKeyDown(Enum.KeyCode.A)           then dir = dir - Camera.CFrame.RightVector end
+    if UIS:IsKeyDown(Enum.KeyCode.D)           then dir = dir + Camera.CFrame.RightVector end
+    if UIS:IsKeyDown(Enum.KeyCode.Space)       then dir = dir + Vector3.new(0,  1, 0)     end
+    if UIS:IsKeyDown(Enum.KeyCode.LeftControl) then dir = dir + Vector3.new(0, -1, 0)     end
     bv.Velocity = dir.Magnitude > 0 and dir.Unit * speed or Vector3.zero
     bg.CFrame   = Camera.CFrame
 end
 
 -- ============================================================
--- §17  TELEPORTE INTERPOLADO — Anti-Teleport Bypass
+-- §17  TELEPORTE INTERPOLADO
 -- ============================================================
--- Micro-passos de ≤4 studs a cada frame para nunca ultrapassar
--- o threshold de teleporte do servidor num único tick.
 
 local function SafeTeleport(target)
     local c = LP.Character
@@ -725,15 +920,101 @@ local function SafeTeleport(target)
     for i = 1, steps do
         if not G.Running then return end
         local alpha = i / steps
-        -- Ease-in-out para o movimento ser mais natural
-        local t  = alpha * alpha * (3 - 2 * alpha)
-        hrp.CFrame = CFrame.new(origin:Lerp(target, t))
+        local t     = alpha * alpha * (3 - 2 * alpha)
+        hrp.CFrame  = CFrame.new(origin:Lerp(target, t))
         task.wait()
     end
 end
 
 -- ============================================================
--- §18  EVENTOS DE PLAYER
+-- §18  HOOKS — Silent Aim + Anti-Kick
+-- ============================================================
+-- Silent aim: intercepta Mouse.Hit via hookmetamethod __index
+-- Anti-kick: intercepta __namecall "Kick" para LP
+-- Ambos usam newcclosure para ofuscar no traceback do executor
+
+local _siHooked  = false
+local _akHooked  = false
+
+local function InstallHooks()
+    if not (hookmetamethod and getrawmetatable and setreadonly and newcclosure) then return end
+
+    local mt  = getrawmetatable(game)
+    local ok  = pcall(setreadonly, mt, false)
+    if not ok then return end
+
+    -- Hook __index (Silent Aim)
+    if not _siHooked then
+        local oldIndex = mt.__index
+        mt.__index = newcclosure(function(self, key)
+            if G.SilentAim and key == "Hit" and rawequal(self, Mouse) then
+                local locked = G.AimState.lockedTarget
+                if locked and IsValid(locked) then
+                    local part = GetAimPart(locked.Character)
+                    if part then
+                        return CFrame.new(part.Position)
+                    end
+                end
+            end
+            return oldIndex(self, key)
+        end)
+        _siHooked = true
+    end
+
+    -- Hook __namecall (Anti-Kick)
+    if not _akHooked then
+        local oldNc = mt.__namecall
+        mt.__namecall = newcclosure(function(self, ...)
+            if getnamecallmethod() == "Kick" and rawequal(self, LP) then
+                return  -- suprime o kick
+            end
+            return oldNc(self, ...)
+        end)
+        _akHooked = true
+    end
+
+    pcall(setreadonly, mt, true)
+end
+
+InstallHooks()
+
+-- ============================================================
+-- §19  TRIGGERBOT
+-- ============================================================
+-- Raycast do centro da tela; se acertar inimigo → mouse1click()
+
+local _tbCooldown = 0
+
+local function RunTriggerbot()
+    if not G.Triggerbot then return end
+    local now = tick()
+    if now - _tbCooldown < 0.08 then return end  -- 80ms entre cliques
+
+    local center  = Camera.ViewportSize / 2
+    local unitRay = Camera:ScreenPointToRay(center.X, center.Y)
+    local ray     = Ray.new(unitRay.Origin, unitRay.Direction * 1000)
+    local ignore  = {}
+    if LP.Character then table.insert(ignore, LP.Character) end
+    table.insert(ignore, workspace.Terrain)
+
+    local hit = workspace:FindPartOnRayWithIgnoreList(ray, ignore)
+    if not hit then return end
+
+    local model = hit:FindFirstAncestorOfClass("Model")
+    if not model then return end
+
+    local target = Players:GetPlayerFromCharacter(model)
+    if not target or not IsValid(target) then return end
+
+    _tbCooldown = now
+    -- mouse1click() é API do executor (Synapse, KRNL, Madium, etc.)
+    if mouse1click then
+        pcall(mouse1click)
+    end
+end
+
+-- ============================================================
+-- §20  EVENTOS DE PLAYER
 -- ============================================================
 
 local function HookPlayer(player)
@@ -744,7 +1025,6 @@ local function HookPlayer(player)
     end)
 end
 
--- Inicializa players já presentes quando o script carrega
 for _, p in ipairs(Players:GetPlayers()) do
     if p ~= LP then
         HookPlayer(p)
@@ -760,7 +1040,6 @@ end)
 Players.PlayerRemoving:Connect(function(p)
     RemoveESP(p)
     RemoveChams(p)
-    -- Limpa state de aimbot se o alvo saiu do jogo
     if G.AimState.lockedTarget == p then
         G.AimState.lockedTarget = nil
         G.AimState.lockedSince  = 0
@@ -768,28 +1047,27 @@ Players.PlayerRemoving:Connect(function(p)
 end)
 
 -- ============================================================
--- §19  LOOP PRINCIPAL — Heartbeat (sincronizado com motor)
+-- §21  LOOP PRINCIPAL — Heartbeat
 -- ============================================================
 
 local hbConn = RunService.Heartbeat:Connect(function(dt)
     if not G.Running then return end
 
-    -- FOV Circle
+    -- FOV Circle segue o mouse
     G.FOVCircle.Position = Vector2.new(Mouse.X, Mouse.Y)
     G.FOVCircle.Radius   = G.FOV
     G.FOVCircle.Visible  = G.AimbotOn
 
-    -- Speed Hack
     if G.SpeedOn then ApplySpeed(dt) end
+    if G.FlyOn   then UpdateFly()    end
 
-    -- Fly
-    if G.FlyOn then UpdateFly() end
-
-    -- Jitter OU (avança o processo independente do aimbot estar ativo ou não,
-    -- para que quando ativar, o estado já esteja "aquecido" e não parta do zero)
+    -- OU jitter sempre avançado (estado "aquecido" ao ativar)
     StepOUJitter(dt)
 
-    -- ESP + Chams por player
+    -- Triggerbot
+    RunTriggerbot()
+
+    -- ESP + Chams
     for _, p in ipairs(Players:GetPlayers()) do
         if p == LP then continue end
         if G.ESPOn then
@@ -805,38 +1083,37 @@ end)
 table.insert(G.Conns, hbConn)
 
 -- ============================================================
--- §20  AIMBOT — RenderStepped (pré-frame, acesso à Camera)
+-- §22  AIMBOT — RenderStepped (acesso à Camera no pré-frame)
 -- ============================================================
 
 local rsConn = RunService.RenderStepped:Connect(function(dt)
     if not G.Running or not G.AimbotOn then return end
+
+    -- ADS Only: aimbot só ativo segurando botão direito
+    if G.ADSOnly and not UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+        return
+    end
 
     local target = GetTarget(dt)
     if not target then return end
 
     local char = target.Character
     if not char then return end
-    local head = char:FindFirstChild("Head")
-    if not head then return end
+    local part = GetAimPart(char)
+    if not part then return end
 
-    -- Atualiza estimativa de velocidade do alvo
-    UpdateVelocity(head)
+    UpdateVelocity(part)
 
-    -- Ponto de mira base: posição predita + humanização
-    local baseAimPos = PredictedPos(head)
+    local baseAimPos = PredictedPos(part)
     local aimPos     = GetHumanizedAimPoint(baseAimPos, dt)
 
-    -- Distância do aim atual ao alvo em pixels (para smoothing adaptivo)
-    local sp        = Camera:WorldToViewportPoint(aimPos)
+    local sp         = Camera:WorldToViewportPoint(aimPos)
     local screenDist = (Vector2.new(sp.X, sp.Y) - Vector2.new(Mouse.X, Mouse.Y)).Magnitude
 
     if G.AimbotMode == "Legit" then
-        -- Aplica jitter gaussiano OU em coordenadas de tela
-        -- Converte offset de pixels para perturbação de CFrame
         local S          = G.AimState
         local camPos     = Camera.CFrame.Position
-        local toTarget   = (aimPos - camPos)
-        local dist3D     = toTarget.Magnitude
+        local dist3D     = (aimPos - camPos).Magnitude
         local pixPerUnit = (Camera.ViewportSize.Y * 0.5) / math.tan(math.rad(Camera.FieldOfView * 0.5))
         local unitsPerPx = dist3D / pixPerUnit
 
@@ -849,7 +1126,6 @@ local rsConn = RunService.RenderStepped:Connect(function(dt)
         Camera.CFrame  = Camera.CFrame:Lerp(targetCF, alpha)
 
     elseif G.AimbotMode == "Rage" then
-        -- Snap direto ao ponto humanizado (sem jitter no Rage)
         Camera.CFrame = CFrame.new(Camera.CFrame.Position, aimPos)
     end
 end)
@@ -857,11 +1133,11 @@ end)
 table.insert(G.Conns, rsConn)
 
 -- ============================================================
--- §21  BOOT NOTIFICATION
+-- §23  BOOT NOTIFICATION
 -- ============================================================
 
 Rayfield:Notify({
-    Title    = "BloxStrike Hub v2",
-    Content  = "Loaded  |  Madium L8  |  Anti-Ban",
+    Title    = "BloxStrike Hub v3",
+    Content  = "Loaded  |  Madium L8  |  Silent Aim + Triggerbot",
     Duration = 5,
 })
